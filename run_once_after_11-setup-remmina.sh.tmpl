@@ -1,0 +1,125 @@
+#!/bin/bash
+# Script para restaurar conexões Remmina do 1Password
+
+set -e
+
+echo "📦 Configurando conexões Remmina do 1Password..."
+
+# Verificar se o 1Password CLI está instalado
+if ! command -v op &> /dev/null; then
+    echo "⚠️  1Password CLI não está instalado. Execute o script setup-pgpass primeiro."
+    exit 1
+fi
+
+# Verificar se o Remmina está instalado
+if ! command -v remmina &> /dev/null; then
+    echo "📦 Instalando Remmina..."
+    if [ -f /etc/arch-release ]; then
+        sudo pacman -S --noconfirm remmina freerdp
+    else
+        sudo apt-get install -y remmina remmina-plugin-rdp
+    fi
+fi
+
+# Criar diretório do Remmina se não existir
+mkdir -p ~/.local/share/remmina
+
+# Função para fazer login no 1Password (reutiliza sessão se existir)
+op_signin() {
+    if ! op account list &>/dev/null; then
+        echo "🔐 Fazendo login no 1Password..."
+        eval $(op signin)
+    fi
+}
+
+op_signin
+
+# Buscar todos os items RDP/VMs
+echo "🔍 Buscando conexões RDP/VM no 1Password..."
+
+# Listar items que parecem ser conexões RDP (ajuste conforme necessário)
+ITEMS=$(op item list --categories "Server" --format json 2>/dev/null || \
+        op item list --tags "rdp,vm,remote" --format json 2>/dev/null || \
+        op item list --format json | jq '.[] | select(.title | ascii_downcase | contains("rdp") or contains("vm") or contains("remote"))')
+
+if [ -z "$ITEMS" ]; then
+    echo "⚠️  Nenhuma conexão RDP/VM encontrada no 1Password"
+    echo "   Certifique-se de que seus items estão categorizados como 'Server'"
+    echo "   ou possuem tags como 'rdp', 'vm' ou 'remote'"
+    
+    echo ""
+    echo "Deseja configurar manualmente? (s/n)"
+    read -r MANUAL
+    
+    if [ "$MANUAL" != "s" ]; then
+        exit 0
+    fi
+    
+    echo "Digite o nome do item no 1Password:"
+    read -r ITEM_NAME
+    ITEMS=$(op item get "$ITEM_NAME" --format json)
+fi
+
+# Processar cada item encontrado
+echo "$ITEMS" | jq -c '.' | while IFS= read -r item; do
+    TITLE=$(echo "$item" | jq -r '.title')
+    ITEM_ID=$(echo "$item" | jq -r '.id')
+    
+    echo "📌 Processando: $TITLE"
+    
+    # Obter detalhes completos do item
+    FULL_ITEM=$(op item get "$ITEM_ID" --format json)
+    
+    # Extrair campos RDP
+    SERVER=$(echo "$FULL_ITEM" | jq -r '.fields[] | select(.label=="server" or .label=="Server" or .label=="host" or .label=="Host" or .label=="address" or .label=="Address") | .value' | head -n1)
+    USERNAME=$(echo "$FULL_ITEM" | jq -r '.fields[] | select(.label=="username" or .label=="Username" or .purpose=="USERNAME") | .value' | head -n1)
+    PASSWORD=$(echo "$FULL_ITEM" | jq -r '.fields[] | select(.label=="password" or .label=="Password" or .purpose=="PASSWORD") | .value' | head -n1)
+    DOMAIN=$(echo "$FULL_ITEM" | jq -r '.fields[] | select(.label=="domain" or .label=="Domain") | .value' | head -n1)
+    PORT=$(echo "$FULL_ITEM" | jq -r '.fields[] | select(.label=="port" or .label=="Port") | .value' | head -n1)
+    
+    # Valores padrão
+    PORT=${PORT:-3389}
+    
+    if [ -n "$SERVER" ] && [ -n "$USERNAME" ]; then
+        # Criar nome de arquivo seguro
+        FILENAME=$(echo "$TITLE" | tr ' /' '_' | tr -cd '[:alnum:]_-')
+        FILEPATH="$HOME/.local/share/remmina/${FILENAME}.remmina"
+        
+        echo "   Criando: $FILEPATH"
+        
+        # Criar arquivo de conexão Remmina
+        cat > "$FILEPATH" << EOF
+[remmina]
+group=
+protocol=RDP
+server=$SERVER
+username=$USERNAME
+password=$PASSWORD
+domain=$DOMAIN
+resolution_mode=2
+color_depth=32
+glyph_cache=1
+precommand=
+postcommand=
+name=$TITLE
+shareprinter=0
+sharesmartcard=0
+resolution_width=1920
+resolution_height=1080
+EOF
+        
+        # Definir permissões
+        chmod 600 "$FILEPATH"
+        
+        echo "   ✅ Conexão criada"
+    else
+        echo "   ⚠️  Campos obrigatórios faltando (server/username)"
+    fi
+done
+
+echo ""
+echo "✅ Configuração do Remmina concluída!"
+echo "   Conexões salvas em: ~/.local/share/remmina/"
+
+# Limpar variáveis sensíveis
+unset PASSWORD USERNAME DOMAIN SERVER PORT

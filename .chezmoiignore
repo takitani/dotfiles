@@ -1,0 +1,6 @@
+{{ if not .useZsh }}
+encrypted_dot_zshrc
+encrypted_private_dot_zsh_history
+dot_zshrc
+private_dot_zsh_history
+{{ end }}

@@ -1,0 +1,143 @@
+#!/bin/bash
+# Script para restaurar .pgpass do 1Password automaticamente
+
+set -e
+
+echo "📦 Configurando .pgpass do 1Password..."
+
+# Verificar se o 1Password CLI está instalado
+if ! command -v op &> /dev/null; then
+    echo "⚠️  1Password CLI não encontrado. Instalando..."
+    
+    # Detectar sistema e instalar
+    if [ -f /etc/arch-release ]; then
+        # Para Arch, geralmente via AUR
+        yay -S --noconfirm 1password-cli || {
+            echo "📥 Instalando 1Password CLI manualmente..."
+            curl -sSfo op.zip https://cache.agilebits.com/dist/1P/op2/pkg/v2.24.0/op_linux_amd64_v2.24.0.zip
+            unzip -o op.zip
+            sudo mv op /usr/local/bin/
+            rm op.zip
+        }
+    elif [ -f /etc/debian_version ]; then
+        # Para Debian/Ubuntu
+        curl -sS https://downloads.1password.com/linux/keys/1password.asc | sudo gpg --dearmor --output /usr/share/keyrings/1password-archive-keyring.gpg
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/1password-archive-keyring.gpg] https://downloads.1password.com/linux/debian/$(dpkg --print-architecture) stable main" | sudo tee /etc/apt/sources.list.d/1password.list
+        sudo apt update && sudo apt install -y 1password-cli
+    else
+        echo "❌ Sistema não suportado. Instale o 1Password CLI manualmente."
+        echo "   Visite: https://developer.1password.com/docs/cli/get-started#install"
+        exit 1
+    fi
+fi
+
+# Função para fazer login no 1Password
+op_signin() {
+    # Verificar se já está autenticado
+    if ! op account list &>/dev/null; then
+        echo "🔐 Fazendo login no 1Password..."
+        echo ""
+        echo "Digite o endereço da sua conta 1Password (ex: mycompany.1password.com):"
+        read -r OP_ACCOUNT
+        
+        # Fazer signin
+        eval $(op signin --account "$OP_ACCOUNT")
+        
+        if [ $? -ne 0 ]; then
+            echo "❌ Falha no login do 1Password"
+            exit 1
+        fi
+    fi
+}
+
+# Login no 1Password
+op_signin
+
+# Opção 1: Buscar item por nome/título
+ITEM_NAME="PostgreSQL Production"  # AJUSTE conforme o nome no seu 1Password
+echo "🔍 Buscando credenciais: $ITEM_NAME"
+
+# Tentar buscar o item
+ITEM_ID=$(op item list --format json | jq -r ".[] | select(.title==\"$ITEM_NAME\") | .id" 2>/dev/null)
+
+if [ -z "$ITEM_ID" ]; then
+    echo "⚠️  Item '$ITEM_NAME' não encontrado."
+    echo "   Items disponíveis com 'postgres' no nome:"
+    op item list --format json | jq -r '.[] | select(.title | ascii_downcase | contains("postgres")) | .title'
+    echo ""
+    echo "Digite o nome exato do item:"
+    read -r ITEM_NAME
+    ITEM_ID=$(op item list --format json | jq -r ".[] | select(.title==\"$ITEM_NAME\") | .id")
+fi
+
+if [ -z "$ITEM_ID" ]; then
+    echo "❌ Item não encontrado no 1Password"
+    exit 1
+fi
+
+# Obter o item completo
+echo "📄 Obtendo detalhes do item..."
+ITEM=$(op item get "$ITEM_ID" --format json)
+
+# Extrair credenciais - 1Password tem estrutura diferente
+# Para campos customizados
+HOST=$(echo "$ITEM" | jq -r '.fields[] | select(.label=="host" or .label=="Host" or .label=="server" or .label=="Server") | .value' 2>/dev/null | head -n1)
+PORT=$(echo "$ITEM" | jq -r '.fields[] | select(.label=="port" or .label=="Port") | .value' 2>/dev/null | head -n1)
+DATABASE=$(echo "$ITEM" | jq -r '.fields[] | select(.label=="database" or .label=="Database" or .label=="db" or .label=="DB") | .value' 2>/dev/null | head -n1)
+USERNAME=$(echo "$ITEM" | jq -r '.fields[] | select(.label=="username" or .label=="Username" or .label=="user" or .label=="User") | .value' 2>/dev/null | head -n1)
+PASSWORD=$(echo "$ITEM" | jq -r '.fields[] | select(.label=="password" or .label=="Password") | .value' 2>/dev/null | head -n1)
+
+# Se não encontrou, tentar estrutura de login padrão
+if [ -z "$USERNAME" ]; then
+    USERNAME=$(echo "$ITEM" | jq -r '.fields[] | select(.purpose=="USERNAME") | .value' 2>/dev/null)
+fi
+if [ -z "$PASSWORD" ]; then
+    PASSWORD=$(echo "$ITEM" | jq -r '.fields[] | select(.purpose=="PASSWORD") | .value' 2>/dev/null)
+fi
+
+# Se ainda não tem todos os campos, perguntar ao usuário
+if [ -z "$HOST" ]; then
+    echo "Host não encontrado no item. Digite o host:"
+    read -r HOST
+fi
+if [ -z "$PORT" ]; then
+    echo "Port não encontrado no item. Digite a porta (padrão: 5432):"
+    read -r PORT
+    PORT=${PORT:-5432}
+fi
+if [ -z "$DATABASE" ]; then
+    echo "Database não encontrado no item. Digite o nome do database:"
+    read -r DATABASE
+fi
+
+# Validar que temos todos os campos essenciais
+if [ -z "$HOST" ] || [ -z "$PORT" ] || [ -z "$DATABASE" ] || [ -z "$USERNAME" ] || [ -z "$PASSWORD" ]; then
+    echo "❌ Não foi possível obter todas as credenciais necessárias"
+    echo "   Certifique-se de que o item no 1Password contém:"
+    echo "   - host/server"
+    echo "   - port" 
+    echo "   - database"
+    echo "   - username"
+    echo "   - password"
+    exit 1
+fi
+
+# Criar .pgpass
+echo "✍️  Criando ~/.pgpass..."
+cat > ~/.pgpass << EOF
+$HOST:$PORT:$DATABASE:$USERNAME:$PASSWORD
+EOF
+
+# Definir permissões corretas
+chmod 600 ~/.pgpass
+
+echo "✅ .pgpass configurado com sucesso!"
+echo "   Host: $HOST:$PORT"
+echo "   Database: $DATABASE"
+echo "   User: $USERNAME"
+
+# Fazer signout por segurança (opcional - comente se preferir manter logado)
+# op signout
+
+# Limpar variáveis sensíveis
+unset PASSWORD USERNAME DATABASE PORT HOST ITEM ITEM_ID

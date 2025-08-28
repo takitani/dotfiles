@@ -1,0 +1,184 @@
+#!/bin/bash
+# Script para configurar chaves SSH do 1Password
+# IMPORTANTE: Roda PRIMEIRO (01) para garantir que SSH está pronto para git
+
+set -e
+
+echo "🔐 Configurando SSH do 1Password..."
+
+# Criar diretório SSH se não existir
+mkdir -p ~/.ssh
+chmod 700 ~/.ssh
+
+# Verificar se o 1Password CLI está instalado
+if ! command -v op &> /dev/null; then
+    echo "⚠️  1Password CLI não encontrado. Instalando..."
+    
+    if [ -f /etc/arch-release ]; then
+        # Para Arch
+        if command -v yay &> /dev/null; then
+            yay -S --noconfirm 1password-cli
+        else
+            curl -sSfo op.zip https://cache.agilebits.com/dist/1P/op2/pkg/v2.24.0/op_linux_amd64_v2.24.0.zip
+            unzip -o op.zip
+            sudo mv op /usr/local/bin/
+            rm op.zip
+        fi
+    fi
+fi
+
+# Verificar se já está autenticado
+if ! op account list &>/dev/null; then
+    echo "🔐 Fazendo login no 1Password..."
+    echo "Digite o endereço da sua conta (ex: mycompany.1password.com):"
+    read -r OP_ACCOUNT
+    eval $(op signin --account "$OP_ACCOUNT")
+fi
+
+echo ""
+echo "📋 Configuração de chaves SSH"
+echo "=============================="
+echo ""
+
+# Opção 1: Usar SSH Agent do 1Password (RECOMENDADO)
+echo "O 1Password pode gerenciar suas chaves SSH de duas formas:"
+echo ""
+echo "1. [RECOMENDADO] Usar 1Password SSH Agent - mais seguro"
+echo "2. Exportar chaves para ~/.ssh - tradicional"
+echo ""
+echo "Qual opção você prefere? (1 ou 2):"
+read -r SSH_OPTION
+
+if [ "$SSH_OPTION" = "1" ]; then
+    # Configurar 1Password SSH Agent
+    echo "🔧 Configurando 1Password SSH Agent..."
+    
+    # Criar configuração SSH para usar o agent do 1Password
+    cat > ~/.ssh/config << 'EOF'
+# 1Password SSH Agent
+Host *
+    IdentityAgent ~/.1password/agent.sock
+    
+# Suas configurações específicas de hosts
+# Adicione aqui outros hosts conforme necessário
+EOF
+
+    # Adicionar ao bashrc/zshrc para configurar o agent
+    SHELL_RC="$HOME/.bashrc"
+    if [ -n "$ZSH_VERSION" ]; then
+        SHELL_RC="$HOME/.zshrc"
+    fi
+    
+    # Verificar se já não está configurado
+    if ! grep -q "SSH_AUTH_SOCK" "$SHELL_RC"; then
+        echo "" >> "$SHELL_RC"
+        echo "# 1Password SSH Agent" >> "$SHELL_RC"
+        echo 'export SSH_AUTH_SOCK=~/.1password/agent.sock' >> "$SHELL_RC"
+    fi
+    
+    echo "✅ 1Password SSH Agent configurado!"
+    echo ""
+    echo "⚠️  IMPORTANTE:"
+    echo "   1. Abra o 1Password desktop app"
+    echo "   2. Vá em Settings > Developer"
+    echo "   3. Ative 'Use the SSH agent'"
+    echo "   4. Suas chaves SSH devem estar no 1Password como tipo 'SSH Key'"
+    echo "   5. Reinicie o terminal após configurar"
+    
+else
+    # Exportar chaves do 1Password
+    echo "📥 Exportando chaves SSH do 1Password..."
+    echo ""
+    
+    # Listar chaves SSH disponíveis
+    echo "🔍 Buscando chaves SSH no 1Password..."
+    SSH_ITEMS=$(op item list --categories "SSH Key" --format json 2>/dev/null || \
+                op item list --format json | jq '.[] | select(.title | contains("SSH") or contains("ssh"))')
+    
+    if [ -z "$SSH_ITEMS" ]; then
+        echo "⚠️  Nenhuma chave SSH encontrada no 1Password"
+        echo "   Certifique-se de adicionar suas chaves como tipo 'SSH Key'"
+        exit 1
+    fi
+    
+    echo "Chaves SSH encontradas:"
+    echo "$SSH_ITEMS" | jq -r '.title'
+    echo ""
+    
+    # Processar cada chave
+    echo "$SSH_ITEMS" | jq -c '.' | while IFS= read -r item; do
+        TITLE=$(echo "$item" | jq -r '.title')
+        ITEM_ID=$(echo "$item" | jq -r '.id')
+        
+        echo "📌 Processando: $TITLE"
+        
+        # Obter a chave privada
+        PRIVATE_KEY=$(op read "op://Private/$TITLE/private_key" 2>/dev/null || \
+                      op document get "$ITEM_ID" 2>/dev/null || \
+                      op item get "$ITEM_ID" --fields "private_key" 2>/dev/null)
+        
+        if [ -n "$PRIVATE_KEY" ]; then
+            # Determinar nome do arquivo
+            KEY_FILE=""
+            case "$TITLE" in
+                *"rsa"*|*"RSA"*)
+                    KEY_FILE="$HOME/.ssh/id_rsa"
+                    ;;
+                *"ed25519"*|*"ED25519"*)
+                    KEY_FILE="$HOME/.ssh/id_ed25519"
+                    ;;
+                *"ecdsa"*|*"ECDSA"*)
+                    KEY_FILE="$HOME/.ssh/id_ecdsa"
+                    ;;
+                *)
+                    # Nome genérico baseado no título
+                    SAFE_NAME=$(echo "$TITLE" | tr ' /' '_' | tr -cd '[:alnum:]_-' | tr '[:upper:]' '[:lower:]')
+                    KEY_FILE="$HOME/.ssh/id_$SAFE_NAME"
+                    ;;
+            esac
+            
+            # Salvar chave privada
+            echo "$PRIVATE_KEY" > "$KEY_FILE"
+            chmod 600 "$KEY_FILE"
+            echo "   ✅ Chave privada salva: $KEY_FILE"
+            
+            # Tentar obter chave pública
+            PUBLIC_KEY=$(op read "op://Private/$TITLE/public_key" 2>/dev/null || \
+                        op item get "$ITEM_ID" --fields "public_key" 2>/dev/null)
+            
+            if [ -n "$PUBLIC_KEY" ]; then
+                echo "$PUBLIC_KEY" > "${KEY_FILE}.pub"
+                chmod 644 "${KEY_FILE}.pub"
+                echo "   ✅ Chave pública salva: ${KEY_FILE}.pub"
+            else
+                # Gerar chave pública a partir da privada
+                ssh-keygen -y -f "$KEY_FILE" > "${KEY_FILE}.pub" 2>/dev/null || true
+            fi
+        else
+            echo "   ⚠️  Não foi possível extrair a chave privada"
+        fi
+    done
+fi
+
+# Configurar known_hosts se existir no 1Password
+echo ""
+echo "🔍 Buscando known_hosts..."
+KNOWN_HOSTS=$(op read "op://Private/SSH known_hosts/notesPlain" 2>/dev/null || \
+              op document get "known_hosts" 2>/dev/null || true)
+
+if [ -n "$KNOWN_HOSTS" ]; then
+    echo "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+    chmod 644 ~/.ssh/known_hosts
+    echo "✅ known_hosts restaurado"
+fi
+
+echo ""
+echo "✅ Configuração SSH concluída!"
+echo ""
+echo "📝 Próximos passos:"
+echo "   1. Teste suas conexões SSH"
+echo "   2. Se usar o agent do 1Password, reinicie o terminal"
+echo "   3. Adicione novas chaves sempre pelo 1Password"
+
+# Limpar variáveis sensíveis
+unset PRIVATE_KEY PUBLIC_KEY KNOWN_HOSTS OP_SESSION
